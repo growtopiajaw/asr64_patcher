@@ -1,4 +1,9 @@
+#ifdef __gnu_linux__
+    #define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -75,10 +80,52 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
     return 0;
 }
 
+static addr_t
+branch_ref64_back(const uint8_t *buf, addr_t start, size_t length) {
+
+    //find b/bl instruction
+    uint32_t bit_mask = 0xFC000000;
+    uint32_t instr = 0;
+    uint32_t branch_offset = 0;
+    uint32_t imm = 0;
+    addr_t bl = start;
+    addr_t end = start - length;
+    while (bl >= end) {
+        instr = *(uint32_t *) (buf + bl);
+        if ((instr & bit_mask) == 0x14000000 /*b*/ || (instr & bit_mask) == 0x94000000 /*bl*/) {
+            imm = instr & 0x03FFFFFF;
+            branch_offset = imm << 2;
+            if (bl + branch_offset == start)
+                return bl;
+        }
+        bl -= 4;
+    }
+
+    return 0;
+
+}
+
+/*function imported from xerub's patchfinder64*/
+
+static addr_t
+step64_back(const uint8_t *buf, addr_t start, size_t length, uint32_t what, uint32_t mask)
+{
+    addr_t end = start - length;
+    while (start >= end) {
+        uint32_t x = *(uint32_t *)(buf + start);
+        if ((x & mask) == what) {
+            return start;
+        }
+        start -= 4;
+    }
+    return 0;
+}
+
 void exception() {
         printf("exploit3d exception = what????\n");
     	exit(1);
 }
+
 
 
 int get_asr_patch(void *asr, size_t len) {
@@ -90,7 +137,7 @@ int get_asr_patch(void *asr, size_t len) {
     	exception();
     }
 
-	printf("[*] Image failed signature verification %p\n", failed);
+	printf("[*] Image failed signature verification string at 0x%llx\n", (uint64_t) GET_OFFSET(len, failed));
 
     void *passed = memmem(asr,len,"Image passed signature verification", strlen("Image passed signature verification"));
 
@@ -98,7 +145,7 @@ int get_asr_patch(void *asr, size_t len) {
     	exception();
     }
 
-    printf("[*] Image passed signature verification %p\n", passed);
+    printf("[*] Image passed signature verification string at 0x%llx\n", (uint64_t) GET_OFFSET(len, passed));
 
     addr_t ref_failed = xref64(asr,0,len,(addr_t)GET_OFFSET(len, failed));
     
@@ -106,21 +153,58 @@ int get_asr_patch(void *asr, size_t len) {
     	exception();
     }
 
+    printf("[*] xref to Image failed signature verification string at 0x%llx\n", ref_failed);
+
     addr_t ref_passed = xref64(asr,0,len,(addr_t)GET_OFFSET(len, passed));
     
     if(!ref_passed) {
     	exception();
     }
 
+    //check if the failed string is loaded inside a subroutine
+    addr_t stp = 0;
+    uint32_t stp_mask = 0xFFC00000;
+    //Signed offset stp
+    if (step64_back(asr, ref_failed, 4 * 7, 0xA9000000, stp_mask))
+        stp = step64_back(asr, ref_failed, 4 * 7, 0xA9000000, stp_mask);
+    //Pre-index stp
+    else if (step64_back(asr, ref_failed, 4 * 7, 0xA9800000, stp_mask))
+        stp = step64_back(asr, ref_failed, 4 * 7, 0xA9800000, stp_mask);
+    //Post-index stp
+    else if (step64_back(asr, ref_failed, 4 * 7, 0xA8800000, stp_mask))
+        stp = step64_back(asr, ref_failed, 4 * 7, 0xA8800000, stp_mask);
+
+
+    //find the location where the funtion is called
+    addr_t branch_ref = 0;
+
+    if (stp)   {
+        for (int i = 0; i < 4; i++, stp -= 4) {
+            branch_ref = branch_ref64_back(asr, stp, stp - 4);
+            if (branch_ref) {
+                printf("[*] branch to Image failed signature verification block at 0x%llx\n", branch_ref);
+                break;
+            }
+        }
+    }
+
     printf("[*] Assembling arm64 branch\n");
 
-    uintptr_t ref1 = (uintptr_t)ref_failed;
+    uintptr_t ref1 = 0;
+
+    if (branch_ref)
+        ref1 = (uintptr_t) branch_ref;
+    else
+        ref1 = (uintptr_t) ref_failed;
  
     uintptr_t ref2 = (uintptr_t)ref_passed;
 
     uint32_t our_branch = arm64_branch_instruction(ref1, ref2);
 
-    *(uint32_t *) (asr + ref_failed) = our_branch;
+    if (branch_ref)
+        *(uint32_t *) (asr + branch_ref) = our_branch;
+    else
+        *(uint32_t *) (asr + ref_failed) = our_branch;
 
     return 0;
 
